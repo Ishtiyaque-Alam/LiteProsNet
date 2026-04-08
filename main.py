@@ -262,7 +262,7 @@ def train():
 	exp_lr_scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1)
 
 	################  train  model ##########################
-	num_epoch=800
+	num_epoch=200
 	best_loss=9999.9
 	best_acc=0
 	train_loss_list, train_acc_list = [], []
