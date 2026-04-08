@@ -129,6 +129,7 @@ def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler)
 		inputs = inputs.float().to("cuda:0")
 		label = label.float().to("cuda:0")
 		clinical = clinical.float().to("cuda:0")
+		optimizer.zero_grad(set_to_none=True)
 
 		outputs, z1, z2 = net(inputs,clinical)
 		loss = entropy_loss(outputs, label) + l1_loss(outputs, label)
@@ -148,8 +149,14 @@ def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler)
 		label_c=torch.cat((label_c,label))
 		outputs_c=torch.cat((outputs_c,outputs))
 
-	ctd = concordance_index_censored(event_c.view(-1).cpu().detach().numpy(), label_c.view(-1).cpu().detach().numpy(),
-									 outputs_c.view(-1).cpu().detach().numpy())
+	# Guard against occasional NaNs/Inf in predictions so C-index computation doesn't crash.
+	est = outputs_c.view(-1).cpu().detach().numpy()
+	est = np.nan_to_num(est, nan=0.0, posinf=1e6, neginf=-1e6)
+	ctd = concordance_index_censored(
+		event_c.view(-1).cpu().detach().numpy(),
+		label_c.view(-1).cpu().detach().numpy(),
+		est,
+	)
 	accracy = correct/len(data_loader.dataset)
 	train_loss = train_loss / count
 	if (1-ctd[0]) > best_con:
