@@ -1,144 +1,346 @@
-import numpy as np
-import torch
-import torchvision
-from torch.utils.data import Dataset
-import  PIL
+"""
+Data loader for Lite-ProSENet adapted to NSCLC-Radiomics on Kaggle.
+
+Replaces the original file-folder-based loader (which expected pre-cropped
+GTV .mhd files) with a DICOM-based loader that:
+  - Reads ct_path and seg_path from phase1_metadata CSV
+  - Corrects the Kaggle path prefix
+  - Merges with the clinical CSV for EHR features and survival labels
+  - Performs GTV bounding-box crop (same as FinalProject)
+  - Resamples to the fixed spatial size expected by the model (96x96x12)
+  - Returns (img, clinical_diag, label, event) matching the original contract
+"""
+
 import os
-from PIL import Image
-import time
-import collections
-import random
-
-from scipy.ndimage import zoom
+import glob
 import warnings
-from scipy.ndimage.interpolation import rotate
 
-import pandas
+import numpy as np
+import pandas as pd
 import SimpleITK as sitk
-
+import torch
+from torch.utils.data import Dataset
+from scipy.ndimage import zoom
 from scipy.ndimage.interpolation import rotate
 
-def augment(sample,  ifflip=True, ifrotate=True, ifswap=True):
-    #                     angle1 = np.random.rand()*180
+# ---------------------------------------------------------------------------
+# Path correction (mirrors FinalProject/dataset.py)
+# ---------------------------------------------------------------------------
+
+OLD_PREFIX = "/kaggle/input/nsclc-radiomics/NSCLC-Radiomics/"
+NEW_PREFIX  = "/kaggle/input/datasets/umutkrdrms/nsclc-radiomics/NSCLC-Radiomics/"
+
+def fix_path(path: str) -> str:
+    return path.replace(OLD_PREFIX, NEW_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# DICOM loading helpers (mirrors FinalProject/dataset.py)
+# ---------------------------------------------------------------------------
+
+def load_dicom_series(directory: str) -> sitk.Image:
+    """Load a DICOM series and return a SimpleITK Image (keeps spacing info)."""
+    reader = sitk.ImageSeriesReader()
+    dicom_files = reader.GetGDCMSeriesFileNames(directory)
+    if len(dicom_files) == 0:
+        dcm_files = sorted(glob.glob(os.path.join(directory, "*.dcm")))
+        if len(dcm_files) == 0:
+            dcm_files = sorted(glob.glob(os.path.join(directory, "*")))
+        dicom_files = dcm_files
+    reader.SetFileNames(dicom_files)
+    return reader.Execute()
+
+
+def load_segmentation_array(directory: str) -> np.ndarray:
+    """Load segmentation mask; returns binary (D,H,W) float32 array or None."""
+    try:
+        reader = sitk.ImageSeriesReader()
+        dicom_files = reader.GetGDCMSeriesFileNames(directory)
+        if len(dicom_files) == 0:
+            dicom_files = sorted(glob.glob(os.path.join(directory, "*")))
+        reader.SetFileNames(dicom_files)
+        image = reader.Execute()
+        array = sitk.GetArrayFromImage(image)
+        return (array > 0).astype(np.float32)
+    except Exception:
+        import pydicom
+        files = sorted(glob.glob(os.path.join(directory, "*")))
+        if not files:
+            return None
+        try:
+            ds = pydicom.dcmread(files[0])
+            if hasattr(ds, "pixel_array"):
+                arr = ds.pixel_array.astype(np.float32)
+                if arr.ndim == 2:
+                    arr = arr[np.newaxis]
+                return (arr > 0).astype(np.float32)
+        except Exception:
+            pass
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GTV crop (mirrors FinalProject/dataset.py)
+# ---------------------------------------------------------------------------
+
+def gtv_crop(ct_array: np.ndarray, seg_array: np.ndarray,
+             margin: int = 10) -> tuple:
+    """Tight bounding-box crop around the GTV with a voxel margin."""
+    coords = np.argwhere(seg_array > 0)
+    if coords.shape[0] == 0:
+        return ct_array, seg_array
+
+    D, H, W = ct_array.shape
+    d_min, h_min, w_min = coords.min(axis=0)
+    d_max, h_max, w_max = coords.max(axis=0)
+
+    d_min = max(d_min - margin, 0)
+    h_min = max(h_min - margin, 0)
+    w_min = max(w_min - margin, 0)
+    d_max = min(d_max + margin + 1, D)
+    h_max = min(h_max + margin + 1, H)
+    w_max = min(w_max + margin + 1, W)
+
+    return (
+        ct_array[d_min:d_max, h_min:h_max, w_min:w_max],
+        seg_array[d_min:d_max, h_min:h_max, w_min:w_max],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Augmentation (preserved exactly from original data.py)
+# ---------------------------------------------------------------------------
+
+def augment(sample, ifflip=True, ifrotate=True, ifswap=True):
     if ifrotate:
-        validrot = False
-        counter = 0
         angle1 = np.random.rand() * 180
-        size = np.array(sample.shape[2:4]).astype('float')
-        rotmat = np.array([[np.cos(angle1 / 180 * np.pi), -np.sin(angle1 / 180 * np.pi)],
-                           [np.sin(angle1 / 180 * np.pi), np.cos(angle1 / 180 * np.pi)]])
         sample = rotate(sample, angle1, axes=(2, 1), reshape=False)
     if ifswap:
         if sample.shape[1] == sample.shape[2] and sample.shape[1] == sample.shape[0]:
             axisorder = np.random.permutation(2)
             sample = np.transpose(sample, np.concatenate([[0], axisorder + 1]))
-
     if ifflip:
-        flipid = np.array([np.random.randint(2), np.random.randint(2), np.random.randint(2)]) * 2 - 1
+        flipid = np.array([np.random.randint(2),
+                           np.random.randint(2),
+                           np.random.randint(2)]) * 2 - 1
         sample = np.ascontiguousarray(sample[::flipid[0], ::flipid[1], ::flipid[2]])
     return sample
 
+
+# ---------------------------------------------------------------------------
+# Clinical feature columns (mirrors original NSCLC_PROCESSED.CSV columns 2:29)
+# The clinical CSV has 27 usable numeric features after age normalisation.
+# ---------------------------------------------------------------------------
+
+CLINICAL_COLS = [
+    "age",
+    "clinical.T.Stage",
+    "Clinical.N.Stage",
+    "Clinical.M.Stage",
+    "Overall.Stage",
+    "Survival.time",
+    "deadstatus.event",
+]
+
+# All columns that should be one-hot encoded (categorical)
+CATEGORICAL_COLS = [
+    "clinical.T.Stage",
+    "Clinical.N.Stage",
+    "Clinical.M.Stage",
+    "Overall.Stage",
+]
+
+
+def _encode_stage(val) -> list:
+    """One-hot encode a TNM/overall stage value into a fixed 6-dim vector."""
+    stages = ["1", "2", "3", "3a", "3b", "4"]
+    v = str(val).strip().lower().replace("stage", "").strip()
+    vec = [1.0 if v == s else 0.0 for s in stages]
+    return vec
+
+
+def build_clinical_vector(row: pd.Series) -> np.ndarray:
+    """
+    Build the clinical feature vector from a merged CSV row.
+    Produces a 1-D float32 array of length 27 to match the original
+    model's expected clinical input size.
+
+    Layout:
+      [0]       age (normalised /100)
+      [1–6]     T-stage one-hot (6 dims)
+      [7–12]    N-stage one-hot (6 dims)
+      [13–18]   M-stage one-hot (6 dims)
+      [19–24]   Overall-stage one-hot (6 dims)
+      [25]      survival time (normalised, excluded from features to avoid leakage)
+      [26]      dead-status event (0/1)
+    """
+    age = float(row.get("age", 68)) / 100.0
+
+    t  = _encode_stage(row.get("clinical.T.Stage",  ""))
+    n  = _encode_stage(row.get("Clinical.N.Stage",  ""))
+    m  = _encode_stage(row.get("Clinical.M.Stage",  ""))
+    ov = _encode_stage(row.get("Overall.Stage",      ""))
+
+    event = float(row.get("deadstatus.event", 0))
+
+    vec = np.array([age] + t + n + m + ov + [0.0, event], dtype=np.float32)
+    return vec   # shape (27,)
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
 class DataBowl3Classifier(Dataset):
-    def __init__(self, root_path, phase='train', isAugment=True):
-        assert (phase == 'train' or phase == 'val' or phase == 'test')
+    """
+    NSCLC-Radiomics dataset loader for Lite-ProSENet.
 
-        self.phase = phase
-        self.candidate_box = []
-        self.pbb_label = []
+    Replaces the original folder-scan approach with explicit CSV-driven loading
+    from Kaggle DICOM paths, using the same interface as the original:
+        __getitem__ returns (img, clinical_diag, label, event)
 
-        self.filenames = [os.path.join(root_path, idx) for idx in os.listdir(root_path)]
+    Args:
+        metadata_csv : path to phase1_metadata CSV (patient_id, ct_path, seg_path)
+        clinical_csv : path to NSCLC-Radiomics clinical CSV
+        phase        : 'train' | 'val' | 'test'
+        isAugment    : apply random flip/rotate augmentation
+        gtv_margin   : voxel padding around GTV bounding box
+        indices      : optional list of integer indices (for pre-split subsets)
+    """
 
-        self.filenames = list(filter(lambda item: 'GTV' in item,self.filenames))
-        # print(len(list(self.filenames)))
+    # Target spatial size expected by the Lite-ProSENet model
+    NEW_X = 96
+    NEW_Y = 96
+    NEW_Z = 12
 
-        # label_path = "/home/yujwu/Data/NSCLC/survival_estimate/survival_est_1.6/NSCLC_Radiomic_ Lung_version3_201911.csv"
-        label_path = "data/NSCLC_PROCESSED.CSV"
+    def __init__(
+        self,
+        metadata_csv: str,
+        clinical_csv: str,
+        phase: str = "train",
+        isAugment: bool = True,
+        gtv_margin: int = 10,
+        indices: list = None,
+    ):
+        assert phase in ("train", "val", "test")
+        self.phase     = phase
+        self.isAugment = isAugment and (phase == "train")
+        self.gtv_margin = gtv_margin
 
-        data_frame = pandas.read_csv(label_path)
-        data_frame['age'] = data_frame['age'].fillna(68)/100
+        meta_df     = pd.read_csv(metadata_csv)
+        clinical_df = pd.read_csv(clinical_csv)
 
-        # data_annotations = np.array(pandas.read_csv(label_path))
-        data_annotations = np.array(data_frame)
-        self.names = data_annotations[:,1]
-        self.surv_time = data_annotations[:,29]
-        self.event = data_annotations[:,30]
-        self.clinical = data_annotations[:,2:29].astype('float')
-        self.isAugment = isAugment
+        # Fix Kaggle paths
+        meta_df["ct_path"]  = meta_df["ct_path"].apply(fix_path)
+        meta_df["seg_path"] = meta_df["seg_path"].apply(fix_path)
 
-    def data_resample(self,image, isAugment=True):
-        new_x_size = 96
-        new_y_size = 96
-        new_z_size = 12
+        # Merge on patient ID
+        merged = meta_df.merge(
+            clinical_df, left_on="patient_id", right_on="PatientID", how="inner"
+        )
 
+        # Keep only rows with valid survival time
+        merged = merged[merged["Survival.time"].notna()].reset_index(drop=True)
 
-        new_size = [new_x_size, new_y_size, new_z_size]
-        new_spacing = [old_sz * old_spc / new_sz for old_sz, old_spc, new_sz in
-                       zip(image.GetSize(), image.GetSpacing(), new_size)]
+        # Normalise survival time to [0, 1] (the original label scheme)
+        self.max_surv = float(merged["Survival.time"].max())
+
+        if indices is not None:
+            merged = merged.iloc[indices].reset_index(drop=True)
+
+        self.data = merged
+
+    # ------------------------------------------------------------------
+    def _resample(self, sitk_image: sitk.Image, isAugment: bool) -> np.ndarray:
+        """Resample to (NEW_X, NEW_Y, NEW_Z) — mirrors original data_resample."""
+        new_size    = [self.NEW_X, self.NEW_Y, self.NEW_Z]
+        new_spacing = [
+            old_sz * old_spc / new_sz
+            for old_sz, old_spc, new_sz in zip(
+                sitk_image.GetSize(), sitk_image.GetSpacing(), new_size
+            )
+        ]
 
         if isAugment:
-            imgarray = np.array(sitk.GetArrayFromImage(image))
-            augtype = {'flip': True, 'swap': False, 'rotate': False, 'scale': False}
-            aug_img_array = augment(imgarray,
-                                  ifflip=augtype['flip'], ifrotate=augtype['rotate'],
-                                  ifswap=augtype['swap'])
-            augimge=sitk.GetImageFromArray(aug_img_array)
-            image = augimge
+            arr      = sitk.GetArrayFromImage(sitk_image)
+            arr      = augment(arr, ifflip=True, ifrotate=False, ifswap=False)
+            sitk_image = sitk.GetImageFromArray(arr)
 
-        interpolator_type = sitk.sitkLinear
-        new_img = sitk.Resample(image, new_size, sitk.Transform(), interpolator_type, image.GetOrigin(), new_spacing,
-                                image.GetDirection(), 0.0, image.GetPixelIDValue())
-        return new_img
+        new_img = sitk.Resample(
+            sitk_image, new_size, sitk.Transform(),
+            sitk.sitkLinear,
+            sitk_image.GetOrigin(), new_spacing,
+            sitk_image.GetDirection(), 0.0,
+            sitk_image.GetPixelIDValue(),
+        )
+        return sitk.GetArrayFromImage(new_img)
 
-    def data_norm(self, data):
-        data_max = np.max(data)
-        data_min = np.min(data)
-        inter = data_max - data_min
-        data = data - data_min
-        data = (data/inter*255)
-        # transforms.Resize((224, 224))
-        # data = np.reshape(data,(210,10))
-        return data
+    def _data_norm(self, data: np.ndarray) -> np.ndarray:
+        """Normalise to [0, 255] — preserved from original."""
+        dmin, dmax = data.min(), data.max()
+        inter = dmax - dmin
+        if inter == 0:
+            return data
+        return (data - dmin) / inter * 255.0
 
-    def __getitem__(self, idx, split=None):
-        filename = self.filenames[idx] # get the data
-        # get the position of GTV
-        pos = (filename.upper()).find("GTV")
-        # pos = filename.find("GTV")
-        # get the name before GTV
-        name = filename[pos-9: pos]
-        # get the index of name in self.names
-        index = np.where(self.names == name)
-        # print(index)
-        # get the survival year based on the index
-        # Thresh = 3
-        # # Survival_time = int(self.surv_time[index]/365.0 + 0.5)
-        #
-        # if Survival_time > Thresh:
-        #     label = 1
-        # else:
-        #     label = 0
-        label = (self.surv_time[index][0])/max(self.surv_time)
-        # label = int(self.surv_time[index]/365.0 + 0.5)
-        # read the data of filename
-        data = sitk.ReadImage(filename)
-        # get the 3D image
-        data = self.data_resample(data, self.isAugment)
-        # print(f"dimention:{data.GetSize()}")
-        img = sitk.GetArrayFromImage(data)
-
-        img = self.data_norm(img)
-        event = self.event[index][0]
-        if event == 1:
-            event = True
-        elif event==0:
-            event = False
-        # event = self.event[index]
-        # return img, label,event
-        clinical = self.clinical[index][0]
-        # print(clinical,'cliniacl')
-        return img, np.diag(clinical), label, event
-
+    # ------------------------------------------------------------------
     def __len__(self):
-        sample_num = len(self.filenames)
-        return sample_num
+        return len(self.data)
 
+    def __getitem__(self, idx):
+        row     = self.data.iloc[idx]
+        ct_path = row["ct_path"]
+        seg_path = row["seg_path"]
+
+        # ---- Load CT as SimpleITK image --------------------------------
+        sitk_ct = load_dicom_series(ct_path)
+        ct_array = sitk.GetArrayFromImage(sitk_ct).astype(np.float32)
+
+        # ---- Load segmentation mask ------------------------------------
+        seg_array = load_segmentation_array(seg_path)
+        if seg_array is None:
+            seg_array = np.zeros_like(ct_array)
+
+        # Ensure both 3D (D, H, W)
+        for arr_name in ["ct_array", "seg_array"]:
+            arr = locals()[arr_name]
+            if arr.ndim == 2:
+                arr = arr[np.newaxis]
+            elif arr.ndim == 4:
+                arr = arr.squeeze(0) if arr.shape[0] == 1 else arr[..., 0]
+            locals()[arr_name]  # noqa — reassign below
+            if arr_name == "ct_array":
+                ct_array = arr
+            else:
+                seg_array = arr
+
+        # Match shapes if seg differs from CT
+        if seg_array.shape != ct_array.shape:
+            zf = tuple(t / s for s, t in zip(seg_array.shape, ct_array.shape))
+            seg_array = zoom(seg_array, zf, order=0)
+            seg_array = (seg_array > 0.5).astype(np.float32)
+
+        # ---- GTV crop --------------------------------------------------
+        ct_array, seg_array = gtv_crop(ct_array, seg_array, margin=self.gtv_margin)
+
+        # ---- Lung window + rebuild SimpleITK image for resampling ------
+        ct_array = np.clip(ct_array, -1000, 400).astype(np.float32)
+        sitk_cropped = sitk.GetImageFromArray(ct_array)
+        sitk_cropped.CopyInformation(sitk_ct)   # preserve spacing/origin
+
+        # ---- Resample to (96, 96, 12) with optional augmentation -------
+        img = self._resample(sitk_cropped, self.isAugment)
+        img = self._data_norm(img)            # (12, 96, 96) — sitk returns Z,Y,X
+
+        # ---- Clinical vector and survival label ------------------------
+        clinical_vec = build_clinical_vector(row)   # (27,)
+        # Diagonal matrix as expected by the original model: (27, 27)
+        clinical_diag = np.diag(clinical_vec)
+
+        surv  = float(row["Survival.time"])
+        label = surv / self.max_surv            # normalised scalar in [0, 1]
+
+        event_raw = row.get("deadstatus.event", 0)
+        event = bool(int(event_raw) == 1)
+
+        return img, clinical_diag, label, event
