@@ -25,7 +25,7 @@ from model import get_inplanes, BasicBlock, ResNet, Bottleneck
 from lifelines.utils import concordance_index
 import wandb
 
-wandb.init(project='Lite-ProTransformer')
+wandb.init(project='Lite-ProTransformer', mode="disabled")
 
 random.seed(7)
 np.random.seed(7)
