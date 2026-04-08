@@ -136,8 +136,11 @@ def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler)
 		loss_1 = entropy_loss(z1, label)
 		loss_2 = l1_loss(z2, label)
 		loss_ = loss + args.alpha*loss_1 + args.beta*loss_2
+		if not torch.isfinite(loss_):
+			continue
 
 		loss_.backward()
+		torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
 		optimizer.step()
 
 		exp_lr_scheduler.step()
@@ -157,8 +160,8 @@ def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler)
 		label_c.view(-1).cpu().detach().numpy(),
 		est,
 	)
-	accracy = correct/len(data_loader.dataset)
-	train_loss = train_loss / count
+	accracy = correct/len(data_loader.dataset) if len(data_loader.dataset) > 0 else torch.tensor(0.0)
+	train_loss = train_loss / max(count, 1)
 	if (1-ctd[0]) > best_con:
 		best_con = 1 - ctd[0]
 	if accracy < best_acc:
@@ -298,6 +301,8 @@ def train():
 
 		val_loss, val_acc = validate_one_epoch(net, val_loader_case, mse_loss)
 		val_acc1 = val_acc.item()
+		if not np.isfinite(val_acc1):
+			val_acc1 = 1e10
 
 		print(len(train_loader_case.dataset), len(val_loader_case.dataset))
 

@@ -174,16 +174,19 @@ def build_clinical_vector(row: pd.Series) -> np.ndarray:
       [25]      survival time (normalised, excluded from features to avoid leakage)
       [26]      dead-status event (0/1)
     """
-    age = float(row.get("age", 68)) / 100.0
+    age_raw = row.get("age", 68)
+    age = float(age_raw) / 100.0 if pd.notna(age_raw) else 0.68
 
     t  = _encode_stage(row.get("clinical.T.Stage",  ""))
     n  = _encode_stage(row.get("Clinical.N.Stage",  ""))
     m  = _encode_stage(row.get("Clinical.M.Stage",  ""))
     ov = _encode_stage(row.get("Overall.Stage",      ""))
 
-    event = float(row.get("deadstatus.event", 0))
+    event_raw = row.get("deadstatus.event", 0)
+    event = float(event_raw) if pd.notna(event_raw) else 0.0
 
     vec = np.array([age] + t + n + m + ov + [0.0, event], dtype=np.float32)
+    vec = np.nan_to_num(vec, nan=0.0, posinf=1.0, neginf=0.0)
     return vec   # shape (27,)
 
 
@@ -333,16 +336,23 @@ class DataBowl3Classifier(Dataset):
         # ---- Resample to (96, 96, 12) with optional augmentation -------
         img = self._resample(sitk_cropped, self.isAugment)
         img = self._data_norm(img)            # (12, 96, 96) — sitk returns Z,Y,X
+        img = np.nan_to_num(img, nan=0.0, posinf=255.0, neginf=0.0).astype(np.float32)
 
         # ---- Clinical vector and survival label ------------------------
         clinical_vec = build_clinical_vector(row)   # (27,)
         # Diagonal matrix as expected by the original model: (27, 27)
-        clinical_diag = np.diag(clinical_vec)
+        clinical_diag = np.diag(clinical_vec).astype(np.float32)
+        clinical_diag = np.nan_to_num(clinical_diag, nan=0.0, posinf=1.0, neginf=0.0)
 
         surv  = float(row["Survival.time"])
-        label = surv / self.max_surv            # normalised scalar in [0, 1]
+        label = surv / max(self.max_surv, 1e-8)            # normalised scalar in [0, 1]
+        if not np.isfinite(label):
+            label = 0.0
 
         event_raw = row.get("deadstatus.event", 0)
-        event = bool(int(event_raw) == 1)
+        try:
+            event = bool(int(event_raw) == 1)
+        except Exception:
+            event = False
 
         return img, clinical_diag, label, event
