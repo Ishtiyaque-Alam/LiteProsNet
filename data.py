@@ -326,7 +326,9 @@ class DataBowl3Classifier(Dataset):
         # ---- Lung window + rebuild SimpleITK image for resampling ------
         ct_array = np.clip(ct_array, -1000, 400).astype(np.float32)
         sitk_cropped = sitk.GetImageFromArray(ct_array)
-        sitk_cropped.CopyInformation(sitk_ct)   # preserve spacing/origin
+        # Preserve original voxel spacing (size changed after crop, so CopyInformation would fail)
+        sitk_cropped.SetSpacing(sitk_ct.GetSpacing())
+        sitk_cropped.SetDirection(sitk_ct.GetDirection())
 
         # ---- Resample to (96, 96, 12) with optional augmentation -------
         img = self._resample(sitk_cropped, self.isAugment)
