@@ -83,7 +83,10 @@ parser.add_argument('--checkpoint',
 
 args = parser.parse_args()
 
-USE_WANDB = _WANDB_AVAILABLE and not args.no_wandb
+# Never use wandb in test mode (no training metrics to log)
+USE_WANDB = (
+    _WANDB_AVAILABLE and not args.no_wandb and args.mode == "train"
+)
 if USE_WANDB:
     wandb.init(project='Lite-ProTransformer')
 
