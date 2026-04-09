@@ -72,6 +72,14 @@ parser.add_argument('--beta',
 parser.add_argument('--no_wandb',
                     action='store_true',
                     help='Disable wandb logging')
+parser.add_argument('--mode',
+                    choices=['train', 'test'],
+                    default='train',
+                    help='train: full training loop; test: load checkpoint and evaluate on test split')
+parser.add_argument('--checkpoint',
+                    default=None,
+                    type=str,
+                    help='Path to .pth weights (required for --mode test; e.g. best.pth)')
 
 args = parser.parse_args()
 
@@ -81,6 +89,13 @@ if USE_WANDB:
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
+
+
+def _to_float(x):
+    """Convert scalar tensor or Python number to float for logging/plotting."""
+    if torch.is_tensor(x):
+        return float(x.detach().cpu().item())
+    return float(x)
 
 
 def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler):
@@ -126,20 +141,20 @@ def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler)
 
 	ctd = concordance_index_censored(event_c.view(-1).cpu().detach().numpy(), label_c.view(-1).cpu().detach().numpy(),
 									 outputs_c.view(-1).cpu().detach().numpy())
-	accracy = correct/len(data_loader.dataset)
+	accracy = correct / len(data_loader.dataset)
 	train_loss = train_loss / count
+	train_acc = _to_float(accracy)
 	if (1-ctd[0]) > best_con:
 		best_con = 1 - ctd[0]
-	if accracy < best_acc:
-		best_acc = accracy
+	if train_acc < best_acc:
+		best_acc = train_acc
 	if USE_WANDB:
 		wandb.log({'Best concordance': best_con,
 		           'Current concordance': 1-ctd[0],
 		           'Training loss': train_loss,
 		           'Lowest MAE': best_acc})
-	print('training loss: %.4f, accuracy= %.4f, concordance = %.4f, current best concordance = %.4f, current lowest MAE = %.4f' % (train_loss, accracy, 1-ctd[0], best_con, best_acc))
-	LOGGER.info('training loss: %.4f, accuracy= %.4f, concordance = %.4f' % (train_loss, accracy, 1-ctd[0]))
-	train_acc = accracy
+	print('training loss: %.4f, accuracy= %.4f, concordance = %.4f, current best concordance = %.4f, current lowest MAE = %.4f' % (train_loss, train_acc, 1-ctd[0], best_con, best_acc))
+	LOGGER.info('training loss: %.4f, accuracy= %.4f, concordance = %.4f' % (train_loss, train_acc, 1-ctd[0]))
 
 	return train_loss, train_acc
 
@@ -169,12 +184,12 @@ def validate_one_epoch(net, test_loader, entropy_loss):
 		correct += torch.sum(torch.abs(outputs - label)).data
 
 	val_loss = test_loss / count
-	val_acc=correct / len(test_loader.dataset)
+	val_acc = correct / len(test_loader.dataset)
+	val_acc = _to_float(val_acc)
 
 	print('validate loss: %.4f, accuracy= %.4f' % (val_loss, val_acc))
 	LOGGER.info('validate loss: %.4f, accuracy= %.4f' % (val_loss, val_acc))
 
-	# print("validate loss= %f" % test_loss)
 	return val_loss, val_acc
 
 
@@ -277,7 +292,7 @@ def train():
 			net, train_loader_case, mse_loss, optimizer, exp_lr_scheduler)
 
 		val_loss, val_acc=validate_one_epoch(net, val_loader_case, mse_loss)
-		val_acc1=val_acc.item()
+		val_acc1 = val_acc
 
 		print(len(train_loader_case.dataset),len(val_loader_case.dataset))
 
@@ -329,6 +344,116 @@ def train():
 
 	writer.close()
 
+
+def load_checkpoint_weights(net, checkpoint_path):
+	"""Load state_dict from torch.save(net.state_dict()) or nested dict."""
+	state = torch.load(checkpoint_path, map_location=DEVICE)
+	if isinstance(state, dict) and 'state_dict' in state:
+		state = state['state_dict']
+	net.load_state_dict(state, strict=True)
+	print(f"Loaded weights from {checkpoint_path}")
+
+
+def _batch_bool_event(event):
+	"""Normalize event tensor/scalar to a single bool (batch_size==1)."""
+	if torch.is_tensor(event):
+		return bool(event.view(-1)[0].item())
+	return bool(event)
+
+
+def test_run():
+	"""Evaluate a saved checkpoint on data_root/test (same preprocessing as val)."""
+	if not args.checkpoint or not os.path.isfile(args.checkpoint):
+		raise SystemExit(
+			"--mode test requires --checkpoint /path/to/best.pth (or checkpoint.pth)"
+		)
+
+	test_path = os.path.join(args.data_root, "test")
+	if not os.path.isdir(test_path):
+		raise SystemExit(f"Test folder not found: {test_path}")
+
+	dataset_test = DataBowl3Classifier(test_path, phase='test', isAugment=False)
+	test_loader = DataLoader(dataset_test, batch_size=1, shuffle=False, num_workers=2)
+
+	net = ResNet(BasicBlock, [1, 1, 1, 1], get_inplanes())
+	load_checkpoint_weights(net, args.checkpoint)
+	net.to(DEVICE)
+	net.eval()
+
+	mse_loss = torch.nn.MSELoss()
+	test_loss = 0.0
+	count = 0
+	abs_err = 0.0
+
+	event_list, label_list, pred_list = [], [], []
+
+	with torch.no_grad():
+		for data in test_loader:
+			inputs, clinical, label, event = data
+			inputs = inputs.unsqueeze(1)
+			label = label.unsqueeze(1)
+			inputs = inputs.repeat(1, 3, 1, 1, 1)
+			inputs = inputs.float().to(DEVICE)
+			label = label.float().to(DEVICE)
+			clinical = clinical.float().to(DEVICE)
+
+			outputs, _, _ = net(inputs, clinical)
+			loss = mse_loss(outputs, label)
+			test_loss += loss.item()
+			count += 1
+			abs_err += torch.sum(torch.abs(outputs - label)).item()
+
+			event_list.append(_batch_bool_event(event))
+			label_list.append(label.detach().view(-1).cpu().numpy())
+			pred_list.append(outputs.detach().view(-1).cpu().numpy())
+
+	if count == 0:
+		raise SystemExit("Test loader is empty.")
+
+	test_loss /= count
+	mae = abs_err / len(dataset_test)
+
+	ev = np.asarray(event_list, dtype=bool)
+	y_time = np.concatenate(label_list).astype(np.float64)
+	y_pred = np.concatenate(pred_list).astype(np.float64)
+
+	ctd = concordance_index_censored(ev, y_time, y_pred)
+	c_index = float(1.0 - ctd[0])
+
+	# MAE on uncensored only (paper-style)
+	unc = ~ev
+	if unc.any():
+		mae_unc = float(np.mean(np.abs(y_pred[unc] - y_time[unc])))
+	else:
+		mae_unc = float("nan")
+
+	print("=" * 60)
+	print(f"TEST  checkpoint : {args.checkpoint}")
+	print(f"TEST  samples   : {len(dataset_test)}")
+	print(f"TEST  MSE loss  : {test_loss:.6f}")
+	print(f"TEST  MAE (all) : {mae:.6f}")
+	print(f"TEST  MAE (unc.) : {mae_unc:.6f}")
+	print(f"TEST  C-index   : {c_index:.4f}  (1 - sksurv concordance)")
+	print("=" * 60)
+
+	out_txt = os.path.join(args.result_path, "test_metrics.txt")
+	try:
+		os.makedirs(args.result_path, exist_ok=True)
+		with open(out_txt, "w") as f:
+			f.write(f"checkpoint={args.checkpoint}\n")
+			f.write(f"n={len(dataset_test)}\n")
+			f.write(f"mse={test_loss}\n")
+			f.write(f"mae_all={mae}\n")
+			f.write(f"mae_uncensored={mae_unc}\n")
+			f.write(f"c_index={c_index}\n")
+		print(f"Wrote metrics to {out_txt}")
+	except OSError as e:
+		print(f"Could not write {out_txt}: {e}")
+
+
 if __name__ == '__main__':
-	train()
-	print('5_2_hiddenx4layers')
+	if args.mode == 'train':
+		train()
+		print('5_2_hiddenx4layers')
+	else:
+		test_run()
