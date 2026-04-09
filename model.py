@@ -27,7 +27,7 @@ def conv1x1x1(in_planes, out_planes, stride=1):
 					 stride=stride,
 					 bias=False)
 
-hidden_size=24
+hidden_size=32
 class Attention(nn.Module):
 	def __init__(self):
 		super(Attention, self).__init__()
@@ -282,8 +282,9 @@ class ResNet(nn.Module):
 
 		self.attn_layer1 = Attention()
 		self.attn_layer2 = Attention()
-		#self.attn_layer3=	Attention()
-		#self.attn_layer4=	Attention()
+		self.attn_layer3 = Attention()
+		self.attn_layer4 = Attention()
+		self.attn_layer5 = Attention()
 		self.clinical_token = nn.Parameter(torch.zeros(1, hidden_size))
 
 		self.clinical_fc=nn.Sequential(
@@ -349,7 +350,9 @@ class ResNet(nn.Module):
 
 		attn = self.attn_layer1(emb)
 		attn = self.attn_layer2(attn)
-		#attn = self.attn_layer4(self.attn_layer3(attn))
+		attn = self.attn_layer3(attn)
+		attn = self.attn_layer4(attn)
+		attn = self.attn_layer5(attn)
 
 		return attn.view(A_.shape[0],-1)
 
@@ -374,10 +377,10 @@ class ResNet(nn.Module):
 
 		x = self.relu(x)
 
-		# print(x.shape)
-		# x = self.drop(x)
+		x = self.drop1d(x)
 		out =self.attn_op(y)
 		out = self.clinical_fc(out)
+		out = self.drop1d(out)
 		z = torch.cat([x, out], dim=-1)
 		# z = self.fc2(z)
 		#gate = self.gate_fc(z)

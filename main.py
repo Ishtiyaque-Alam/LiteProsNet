@@ -169,6 +169,9 @@ def validate_one_epoch(net, test_loader, entropy_loss):
 	test_loss = 0
 	count = 0
 	correct = 0
+	event_c=torch.tensor([],dtype=torch.bool)
+	label_c=torch.tensor([]).to(DEVICE)
+	outputs_c=torch.tensor([]).to(DEVICE)
 	for i, data in enumerate(test_loader):
 		inputs, clinical, label, event = data
 		inputs = inputs.unsqueeze(1)        # (B,Z,Y,X) → (B,1,Z,Y,X)
@@ -185,15 +188,21 @@ def validate_one_epoch(net, test_loader, entropy_loss):
 		test_loss = test_loss + loss.item()
 		count = count + 1
 		correct += torch.sum(torch.abs(outputs - label)).data
+		event_c=torch.cat((event_c,event))
+		label_c=torch.cat((label_c,label))
+		outputs_c=torch.cat((outputs_c,outputs))
 
+	ctd = concordance_index_censored(event_c.view(-1).cpu().detach().numpy(), label_c.view(-1).cpu().detach().numpy(),
+									 outputs_c.view(-1).cpu().detach().numpy())
+	val_c_index = 1 - ctd[0]
 	val_loss = test_loss / count
 	val_acc = correct / len(test_loader.dataset)
 	val_acc = _to_float(val_acc)
 
-	print('validate loss: %.4f, accuracy= %.4f' % (val_loss, val_acc))
-	LOGGER.info('validate loss: %.4f, accuracy= %.4f' % (val_loss, val_acc))
+	print('validate loss: %.4f, accuracy= %.4f, concordance= %.4f' % (val_loss, val_acc, val_c_index))
+	LOGGER.info('validate loss: %.4f, accuracy= %.4f, concordance= %.4f' % (val_loss, val_acc, val_c_index))
 
-	return val_loss, val_acc
+	return val_loss, val_acc, val_c_index
 
 
 def load_pretrained_model(model, pretrain_path, model_name, n_finetune_classes):
@@ -271,13 +280,9 @@ def train():
 	# mse_loss = nn.BCELoss()
 	# define optimizer
 	learnable_params=filter(lambda p: p.requires_grad, net.parameters())
-	optimizer=torch.optim.Adam(learnable_params, lr = 0.0005, weight_decay=0.001)
-	# optimizer = torch.optim.SGD(learnable_params, lr=0.0001)
-	# print('learning rate', optimizer.state_dict()['param_groups'])
+	optimizer=torch.optim.Adam(learnable_params, lr=0.001, weight_decay=0.001)
 
-	# Decay LR by a factor of 0.1 every 7 epochs
-	#exp_lr_scheduler=lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
-	exp_lr_scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1)
+	exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5)
 
 	################  train  model ##########################
 	num_epoch=500
@@ -294,7 +299,7 @@ def train():
 		train_loss, train_acc=train_one_epoch(
 			net, train_loader_case, mse_loss, optimizer, exp_lr_scheduler)
 
-		val_loss, val_acc=validate_one_epoch(net, val_loader_case, mse_loss)
+		val_loss, val_acc, val_c_index=validate_one_epoch(net, val_loader_case, mse_loss)
 		val_acc1 = val_acc
 
 		print(len(train_loader_case.dataset),len(val_loader_case.dataset))

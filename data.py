@@ -74,7 +74,7 @@ class DataBowl3Classifier(Dataset):
 
         if isAugment:
             imgarray = np.array(sitk.GetArrayFromImage(image))
-            augtype = {'flip': True, 'swap': False, 'rotate': False, 'scale': False}
+            augtype = {'flip': True, 'swap': False, 'rotate': True, 'scale': False}
             aug_img_array = augment(imgarray,
                                   ifflip=augtype['flip'], ifrotate=augtype['rotate'],
                                   ifswap=augtype['swap'])
