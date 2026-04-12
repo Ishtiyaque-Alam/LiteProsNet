@@ -225,7 +225,7 @@ def load_pretrained_model(model, pretrain_path, model_name, n_finetune_classes):
 
 def train():
 	################  load data ##########################
-	batch_size=32
+	batch_size=8
 	workers=4
 	train_path=os.path.join(args.data_root, "train")
 	val_path=os.path.join(args.data_root, "val")
