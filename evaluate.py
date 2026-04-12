@@ -61,7 +61,7 @@ def evaluate_one_epoch(net, test_loader, entropy_loss):
 
 
 def evaluate():
-    batch_size = 8
+    batch_size = 1
     workers = 4
     test_path = "/data/yujwu/NSCLC/survival_estimate/survival_est_xh/data/test"
 
