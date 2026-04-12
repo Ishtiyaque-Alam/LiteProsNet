@@ -132,11 +132,18 @@ def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler,
 
 		# calculate the gradient and update weights
 		scaler.scale(loss_).backward()
+		# Unscale before clipping so clip operates on true gradient magnitudes
+		scaler.unscale_(optimizer)
+		torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
 		scaler.step(optimizer)
 		scaler.update()
 
 		train_loss = train_loss + loss_.item()
 		count = count + 1
+		# Skip NaN outputs to avoid corrupting the concordance accumulator
+		if torch.isnan(outputs).any():
+			print(f"[WARNING] NaN in outputs at batch {i}, skipping accumulation")
+			continue
 		correct += torch.sum(torch.abs(outputs - label)).data
 		event_c=torch.cat((event_c,event))
 		label_c=torch.cat((label_c,label))
@@ -188,6 +195,8 @@ def validate_one_epoch(net, test_loader, entropy_loss):
 
 		test_loss = test_loss + loss.item()
 		count = count + 1
+		if torch.isnan(outputs).any():
+			continue
 		correct += torch.sum(torch.abs(outputs - label)).data
 		event_c=torch.cat((event_c,event))
 		label_c=torch.cat((label_c,label))
