@@ -285,7 +285,7 @@ def train():
 	exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5)
 
 	################  train  model ##########################
-	num_epoch=500
+	num_epoch=50
 	best_loss=9999.9
 	best_acc=0
 	train_loss_list, train_acc_list = [], []
