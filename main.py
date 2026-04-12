@@ -271,6 +271,21 @@ def train():
 	# net.fc=nn.Linear(num_featdim, 50)
 
 	net = ResNet(BasicBlock, [1, 1, 1, 1], get_inplanes())
+
+	# Load MedNet pretrained 3D ResNet-10 weights
+	mednet_path = '/kaggle/input/datasets/jirkaborovec/meidcalnet-pretrained-3d-resnet-weights/resnet_10.pth'
+	if os.path.isfile(mednet_path):
+		pretrain = torch.load(mednet_path, map_location='cpu')
+		state_dict = pretrain.get('state_dict', pretrain)
+		# Remove 'module.' prefix if saved with DataParallel
+		state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+		missing, unexpected = net.load_state_dict(state_dict, strict=False)
+		print(f"Loaded MedNet weights from {mednet_path}")
+		print(f"  Missing keys (new heads — expected): {len(missing)}")
+		print(f"  Unexpected keys (ignored): {len(unexpected)}")
+	else:
+		print(f"[WARNING] MedNet weights not found at {mednet_path} — training from scratch")
+
 	if USE_WANDB:
 		wandb.watch(net)
 	net.to(DEVICE)
