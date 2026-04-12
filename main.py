@@ -149,23 +149,30 @@ def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler,
 		label_c=torch.cat((label_c,label))
 		outputs_c=torch.cat((outputs_c,outputs))
 
-	ctd = concordance_index_censored(event_c.view(-1).cpu().detach().numpy(), label_c.view(-1).cpu().detach().numpy(),
-									 outputs_c.view(-1).cpu().detach().numpy())
-	accracy = correct / len(data_loader.dataset)
+	if len(event_c) > 1:
+		ctd = concordance_index_censored(
+			event_c.view(-1).cpu().detach().numpy(),
+			label_c.view(-1).cpu().detach().numpy(),
+			outputs_c.view(-1).cpu().detach().numpy())
+		c_index = 1 - ctd[0]
+	else:
+		print("[WARNING] All batches had NaN outputs — concordance cannot be computed.")
+		c_index = 0.0
 	train_loss = train_loss / count
+	accracy = correct / max(1, len(outputs_c))
 	train_acc = _to_float(accracy)
 	exp_lr_scheduler.step()
-	if (1-ctd[0]) > best_con:
-		best_con = 1 - ctd[0]
+	if c_index > best_con:
+		best_con = c_index
 	if train_acc < best_acc:
 		best_acc = train_acc
 	if USE_WANDB:
 		wandb.log({'Best concordance': best_con,
-		           'Current concordance': 1-ctd[0],
+		           'Current concordance': c_index,
 		           'Training loss': train_loss,
 		           'Lowest MAE': best_acc})
-	print('training loss: %.4f, accuracy= %.4f, concordance = %.4f, current best concordance = %.4f, current lowest MAE = %.4f' % (train_loss, train_acc, 1-ctd[0], best_con, best_acc))
-	LOGGER.info('training loss: %.4f, accuracy= %.4f, concordance = %.4f' % (train_loss, train_acc, 1-ctd[0]))
+	print('training loss: %.4f, accuracy= %.4f, concordance = %.4f, current best concordance = %.4f, current lowest MAE = %.4f' % (train_loss, train_acc, c_index, best_con, best_acc))
+	LOGGER.info('training loss: %.4f, accuracy= %.4f, concordance = %.4f' % (train_loss, train_acc, c_index))
 
 	return train_loss, train_acc
 
@@ -312,7 +319,7 @@ def train():
 	# mse_loss = nn.BCELoss()
 	# define optimizer
 	learnable_params=filter(lambda p: p.requires_grad, net.parameters())
-	optimizer=torch.optim.Adam(learnable_params, lr=0.001, weight_decay=0.001)
+	optimizer=torch.optim.Adam(learnable_params, lr=1e-4, weight_decay=0.001)
 
 	exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5)
 	scaler = torch.amp.GradScaler('cuda')
