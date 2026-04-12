@@ -279,6 +279,13 @@ def train():
 		state_dict = pretrain.get('state_dict', pretrain)
 		# Remove 'module.' prefix if saved with DataParallel
 		state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+		# Adapt conv1: MedNet was trained with 1-channel CT input.
+		# We use 3-channel input (via .repeat(1,3,1,1,1)), so we replicate the
+		# single-channel weights across 3 channels and scale by 1/3 to preserve
+		# the overall activation magnitude.
+		if 'conv1.weight' in state_dict:
+			w = state_dict['conv1.weight']       # shape: [64, 1, 7, 7, 7]
+			state_dict['conv1.weight'] = w.repeat(1, 3, 1, 1, 1) / 3.0  # [64, 3, 7, 7, 7]
 		missing, unexpected = net.load_state_dict(state_dict, strict=False)
 		print(f"Loaded MedNet weights from {mednet_path}")
 		print(f"  Missing keys (new heads — expected): {len(missing)}")
