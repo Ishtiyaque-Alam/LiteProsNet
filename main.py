@@ -101,7 +101,7 @@ def _to_float(x):
     return float(x)
 
 
-def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler):
+def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler, scaler):
 	#####################  train model	##########################
 	# one epoch
 	global best_con, best_acc
@@ -123,17 +123,17 @@ def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler)
 		clinical = clinical.float().to(DEVICE)
 
 		optimizer.zero_grad()
-		outputs, z1, z2 = net(inputs, clinical)
-		loss = entropy_loss(outputs, label) + l1_loss(outputs, label)
-		loss_1 = entropy_loss(z1, label)
-		loss_2 = l1_loss(z2, label)
-		loss_ = loss + args.alpha*loss_1 + args.beta*loss_2
+		with torch.amp.autocast('cuda'):
+			outputs, z1, z2 = net(inputs, clinical)
+			loss = entropy_loss(outputs, label) + l1_loss(outputs, label)
+			loss_1 = entropy_loss(z1, label)
+			loss_2 = l1_loss(z2, label)
+			loss_ = loss + args.alpha*loss_1 + args.beta*loss_2
 
 		# calculate the gradient and update weights
-		loss_.backward()
-		optimizer.step()
-
-		exp_lr_scheduler.step()
+		scaler.scale(loss_).backward()
+		scaler.step(optimizer)
+		scaler.update()
 
 		train_loss = train_loss + loss_.item()
 		count = count + 1
@@ -147,6 +147,7 @@ def train_one_epoch(net, data_loader, entropy_loss, optimizer, exp_lr_scheduler)
 	accracy = correct / len(data_loader.dataset)
 	train_loss = train_loss / count
 	train_acc = _to_float(accracy)
+	exp_lr_scheduler.step()
 	if (1-ctd[0]) > best_con:
 		best_con = 1 - ctd[0]
 	if train_acc < best_acc:
@@ -224,8 +225,8 @@ def load_pretrained_model(model, pretrain_path, model_name, n_finetune_classes):
 
 def train():
 	################  load data ##########################
-	batch_size=1
-	workers=2
+	batch_size=32
+	workers=4
 	train_path=os.path.join(args.data_root, "train")
 	val_path=os.path.join(args.data_root, "val")
 	# path = "/data/yujwu/NSCLC/survival_estimate/survival_est_xh/data/evaluat"
@@ -283,6 +284,7 @@ def train():
 	optimizer=torch.optim.Adam(learnable_params, lr=0.001, weight_decay=0.001)
 
 	exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5)
+	scaler = torch.amp.GradScaler('cuda')
 
 	################  train  model ##########################
 	num_epoch=50
@@ -297,7 +299,7 @@ def train():
 		print("----epoch %d:" % i)
 		LOGGER.info("----epoch %d:" % i)
 		train_loss, train_acc=train_one_epoch(
-			net, train_loader_case, mse_loss, optimizer, exp_lr_scheduler)
+			net, train_loader_case, mse_loss, optimizer, exp_lr_scheduler, scaler)
 
 		val_loss, val_acc, val_c_index=validate_one_epoch(net, val_loader_case, mse_loss)
 		val_acc1 = val_acc
