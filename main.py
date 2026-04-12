@@ -287,7 +287,7 @@ def train():
 	scaler = torch.amp.GradScaler('cuda')
 
 	################  train  model ##########################
-	num_epoch=50
+	num_epoch=80
 	best_loss=9999.9
 	best_acc=0
 	train_loss_list, train_acc_list = [], []

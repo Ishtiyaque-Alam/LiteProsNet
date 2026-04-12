@@ -377,10 +377,10 @@ class ResNet(nn.Module):
 
 		x = self.relu(x)
 
-		x = self.drop1d(x)
+		# x = self.drop1d(x)  # Dropout disabled
 		out =self.attn_op(y)
 		out = self.clinical_fc(out)
-		out = self.drop1d(out)
+		# out = self.drop1d(out)  # Dropout disabled
 		z = torch.cat([x, out], dim=-1)
 		# z = self.fc2(z)
 		#gate = self.gate_fc(z)
